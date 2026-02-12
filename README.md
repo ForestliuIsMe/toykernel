@@ -23,6 +23,7 @@ CUDA kernel implementations from scratch. 从零学习 CUDA 高性能算子实�
 
 | Status | Kernel | Description |
 |--------|--------|-------------|
+| ⬜ | GEMV | 矩阵-向量乘法 |
 | ⬜ | Naive GEMM | 朴素矩阵乘法 |
 | ⬜ | Sliced-K | K 维度分片优化 |
 | ⬜ | Split-K | 跨块并行 |
@@ -35,11 +36,9 @@ CUDA kernel implementations from scratch. 从零学习 CUDA 高性能算子实�
 | ⬜ | FlashAttention-2 | 前向传播 |
 | ⬜ | FlashDecoding | 推理解码 |
 | ⬜ | RoPE | 旋转位置编码 |
-| ⬜ | RoPE (Indexed) | 索引优化版本 |
 | ⬜ | PagedAttention | vLLM 显存优化 |
-| ⬜ | KV Cache Quant | KV cache 量化 |
+| ⬜ | Sparse GEMM | 稀疏矩阵乘法 |
 | ⬜ | Medusa | 多头并行解码 |
-| ⬜ | H2O Eviction | Heavy-Hitter eviction |
 
 ### Level 4: 量化
 
@@ -47,10 +46,10 @@ CUDA kernel implementations from scratch. 从零学习 CUDA 高性能算子实�
 |--------|--------|-------------|
 | ⬜ | W8A16 Quant | INT8 权重量化 |
 | ⬜ | W4A16 Quant | INT4 权重量化 |
-| ⬜ | W4A4 Quant | INT4 权重+激活 |
 | ⬜ | W8A16 GEMM | INT8 量化乘法 |
 | ⬜ | W4A16 GEMM | INT4 量化乘法 |
-| ⬜ | W4A4 GEMM | INT4×INT4 乘法 |
+| ⬜ | Quantize | 量化 kernel |
+| ⬜ | Quantized GEMM | 量化矩阵乘法 |
 | ⬜ | SmoothQuant | 激活平滑量化 |
 | ⬜ | AWQ | 激活感知量化 |
 
@@ -62,37 +61,50 @@ CUDA kernel implementations from scratch. 从零学习 CUDA 高性能算子实�
 toykernel/
 ├── CMakeLists.txt
 ├── README.md
-├── src/
-│   ├── level1/
-│   │   ├── vector_ops.cu
-│   │   ├── gemv.cu
-│   │   ├── softmax.cu
-│   │   ├── norm.cu
-│   │   └── activation.cu
-│   ├── level2/
-│   │   ├── gemm.cu
-│   │   ├── sliced_k.cu
-│   │   ├── split_k.cu
-│   │   └── persistent.cu
-│   ├── level3/
-│   │   ├── flash_attention.cu
-│   │   ├── flash_decoding.cu
-│   │   ├── rope.cu
-│   │   ├── paged_attention.cu
-│   │   └── decoding.cu
-│   └── level4/
-│       ├── quantize.cu
-│       └── quantized_gemm.cu
-└── include/
-    └── utils.cuh
+├── requirements.txt
+├── scripts/
+│   ├── build.sh
+│   ├── test.sh
+│   ├── benchmark.sh
+│   └── clean.sh
+├── include/
+│   └── utils.cuh
+└── src/
+    ├── level1/              # 基础算子
+    │   ├── vector_ops.cu
+    │   ├── gemv.cu
+    │   ├── softmax.cu
+    │   ├── norm.cu
+    │   └── activation.cu
+    ├── level2/              # GEMM
+    │   ├── gemv.cu
+    │   ├── gemm.cu          # Naive
+    │   ├── sliced_k.cu
+    │   ├── split_k.cu
+    │   └── persistent.cu
+    ├── level3/              # LLM 核心
+    │   ├── flash_attention.cu
+    │   ├── flash_decoding.cu
+    │   ├── rope.cu
+    │   ├── paged_attention.cu
+    │   ├── sparse_gemm.cu
+    │   └── decoding.cu
+    └── level4/              # 量化
+        ├── weight_quant/
+        │   └── w8a16_gemm.cu
+        │   └── w4a16_gemm.cu
+        ├── quantized_ops/
+        │   ├── quantize.cu
+        │   └── quantized_gemm.cu
+        └── activation_quant/
+            ├── smooth_quant.cu
+            └── awq.cu
 ```
 
 ## 🚀 Build
 
 ```bash
-mkdir build && cd build
-cmake ..
-make
+./scripts/build.sh
 ```
 
 ## 📚 Ref
