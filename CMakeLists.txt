@@ -1,28 +1,14 @@
 cmake_minimum_required(VERSION 3.18)
-project(ToyKernel CUDA CXX)
+project(ToyKernel CUDA)
 
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_ARCHITECTURES 80)
 
-# Options
-option(BUILD_TESTS "Build tests" ON)
-option(BUILD_BENCHMARKS "Build benchmarks" ON)
+# All source files
+file(GLOB SOURCES "src/*.cu")
 
-# Find CUDA
-find_package(CUDA REQUIRED)
+# Build executable
+cuda_add_executable(toykernel ${SOURCES})
 
-# Add subdirectories
-add_subdirectory(src)
-add_subdirectory(include)
-
-if(BUILD_TESTS)
-    add_subdirectory(tests)
-endif()
-
-if(BUILD_BENCHMARKS)
-    add_subdirectory(benchmarks)
-endif()
-
-# Print configuration
-message(STATUS "CUDA Compiler: ${CMAKE_CUDA_COMPILER}")
-message(STATUS "CUDA Architecture: ${CMAKE_CUDA_ARCHITECTURES}")
+# Include headers
+target_include_directories(toykernel PRIVATE include)
