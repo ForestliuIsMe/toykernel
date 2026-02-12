@@ -15,16 +15,41 @@ Common CUDA kernel implementations from scratch. 从零学习 CUDA 高性能算�
 | Layernorm | Basic | 层归一化 | ⬜ |
 | RMSNorm | Basic | RMS 归一化 | ⬜ |
 
-### 🚀 Level 2: 核心算子（进阶）
+### 🚀 Level 2: GEMM 核心（进阶）
 
+#### 2.1 Naive GEMM（入门）
 | Kernel | 类型 | Description | Status |
 |--------|------|-------------|--------|
-| GEMM (Naive) | MatMul | 朴素矩阵乘法 | ⬜ |
-| GEMM (Tiled) | MatMul | 分块矩阵乘法 | ⬜ |
-| GEMM (Shared Mem) | MatMul | 共享内存优化 | ⬜ |
-| GEMM (Tensor Core) | MatMul | Tensor Core 加速 | ⬜ |
-| GeLU | Activation | 激活函数 | ⬜ |
-| RoPE | Position | 旋转位置编码 | ⬜ |
+| GEMM (Row-Major) | Naive | 朴素行优先矩阵乘法 | ⬜ |
+| GEMM (Col-Major) | Naive | 朴素列优先矩阵乘法 | ⬜ |
+| GEMV | Naive | 矩阵-向量乘法（GEMM 简化版） | ⬜ |
+
+#### 2.2 Sliced-K（分片策略）
+| Kernel | 类型 | Description | Status |
+|--------|------|-------------|--------|
+| GEMM (Sliced-K Basic) | Sliced-K | 按 K 维度分片，减少共享内存 | ⬜ |
+| GEMM (Sliced-K Warp) | Sliced-K | Warp 级分片并行 | ⬜ |
+| GEMM (Sliced-K TensorCore) | Sliced-K | Tensor Core + Sliced-K 混合 | ⬜ |
+
+#### 2.3 Split-K（跨块并行）
+| Kernel | 类型 | Description | Status |
+|--------|------|-------------|--------|
+| GEMM (Split-K Basic) | Split-K | K 维度跨线程块并行 | ⬜ |
+| GEMM (Split-K Reduce) | Split-K | Split-K + 跨块归约 | ⬜ |
+| GEMM (Split-K Async) | Split-K | 异步执行优化 | ⬜ |
+
+#### 2.4 Persistent（常驻线程）
+| Kernel | 类型 | Description | Status |
+|--------|------|-------------|--------|
+| GEMM (Persistent Basic) | Persistent | 线程常驻，批处理复用 | ⬜ |
+| GEMM (Persistent Stream) | Persistent | 多流并发执行 | ⬜ |
+| GEMM (Persistent TensorCore) | Persistent | Tensor Core + Persistent 模式 | ⬜ |
+
+**GEMM 学习路线：**
+```
+Naive → Sliced-K → Split-K → Persistent
+(理解原理) → (内存优化) → (并行扩展) → (极致性能)
+```
 
 ### 🔥 Level 3: 大模型核心（高阶）
 
@@ -67,12 +92,23 @@ toykernel/
 │   │   ├── gemv.cu
 │   │   ├── softmax.cu
 │   │   └── norm.cu
-│   ├── level2/           # 核心算子
+│   ├── level2/           # GEMM 核心
 │   │   ├── gemm/
-│   │   │   ├── naive.cu
-│   │   │   ├── tiled.cu
-│   │   │   ├── shared.cu
-│   │   │   └── tensor_core.cu
+│   │   │   ├── naive/
+│   │   │   │   ├── row_major.cu
+│   │   │   │   └── col_major.cu
+│   │   │   ├── sliced_k/
+│   │   │   │   ├── basic.cu
+│   │   │   │   ├── warp.cu
+│   │   │   │   └── tensor_core.cu
+│   │   │   ├── split_k/
+│   │   │   │   ├── basic.cu
+│   │   │   │   ├── reduce.cu
+│   │   │   │   └── async.cu
+│   │   │   └── persistent/
+│   │   │       ├── basic.cu
+│   │   │       ├── stream.cu
+│   │   │       └── tensor_core.cu
 │   │   ├── activation.cu
 │   │   └── rope.cu
 │   ├── level3/           # 大模型核心
@@ -116,12 +152,12 @@ make -j$(nproc)
 ## 📚 Reference
 
 - [CUDA C Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/)
+- [CUTLASS GEMM](https://github.com/NVIDIA/cutlass)
 - [FlashAttention Paper](https://arxiv.org/abs/2205.14135)
 - [FlashDecoding Paper](https://arxiv.org/abs/2309.06169)
 - [vLLM PagedAttention](https://arxiv.org/abs/2309.06180)
 - [SmoothQuant](https://arxiv.org/abs/2308.15026)
 - [AWQ](https://arxiv.org/abs/2306.00978)
-- [CUTLASS](https://github.com/NVIDIA/cutlass)
 - [GGML](https://github.com/ggerganov/ggml)
 
 ## 🤝 Contributing
