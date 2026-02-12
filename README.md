@@ -37,14 +37,22 @@ Common CUDA kernel implementations from scratch. 从零学习 CUDA 高性能算�
 
 ### ⚡ Level 4: 量化加速（精通）
 
-| Kernel | 类型 | Description | Status |
-|--------|------|-------------|--------|
-| W8A16 Quant | Quantization | INT8 权重量化 | ⬜ |
-| W8A16 GEMM | Quantization | INT8 量化乘法 | ⬜ |
-| W4A16 Quant | Quantization | INT4 权重量化 | ⬜ |
-| W4A16 GEMM | Quantization | INT4 量化乘法 | ⬜ |
-| SmoothQuant | Quantization | 激活平滑量化 | ⬜ |
-| AWQ Quant | Quantization | 激活感知量化 | ⬜ |
+| Kernel | 类型 | Description | Status | 参考 |
+|--------|------|-------------|--------|------|
+| W8A16 Quant | Quantization | INT8 权重量化，FP16 计算 | ⬜ | AWQ, GPTQ |
+| W8A16 GEMM | Quantization | INT8 量化矩阵乘法 | ⬜ | BitBLAS, TensorRT |
+| W4A16 Quant | Quantization | INT4 权重量化，FP16 计算 | ⬜ | GGUF, AWQ |
+| W4A16 GEMM | Quantization | INT4 量化矩阵乘法 | ⬜ | GGML, AWQ |
+| W4A4 Quant | Quantization | INT4 权重 + INT4 激活 | ⬜ | QLoRA, GPTQ |
+| SmoothQuant | Quantization | 激活平滑，迁移量化难度 | ⬜ | Microsoft |
+| Dequantize | Quantization | 反量化 kernel | ⬜ | 通用 |
+| KV Cache Quant | Quantization | KV cache INT8/INT4 量化 | ⬜ | vLLM, SqueezeLLM |
+
+**量化精度对比：**
+```
+FP16 > W8A16 > W4A16 > W4A4
+显存占用：1x > 0.5x > 0.25x > 0.125x
+```
 
 ---
 
