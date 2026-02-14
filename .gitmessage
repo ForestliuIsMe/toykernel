@@ -1,0 +1,19 @@
+# <type>: <subject>
+
+# Type 类型:
+#   feat     - 新功能
+#   fix      - Bug 修复
+#   refactor - 重构
+#   perf     - 性能优化
+#   docs     - 文档更新
+#   test     - 测试相关
+#   chore    - 构建/工具/依赖
+#   style    - 代码格式（不影响功能）
+
+# <body> 详细说明（可选）
+# - 做了什么修改
+# - 为什么这样做
+# - 有什么注意事项
+
+# Author: elucat
+# Date:   YYYY-MM-DD
