@@ -11,7 +11,6 @@ CUDA kernel implementations from scratch. 从零学习 CUDA 高性能算子实�
 | ⬜ | Vector Add | 向量相加 |
 | ⬜ | Vector Mul | 向量乘法 |
 | ⬜ | Vector Scale | 向量缩放 |
-| ⬜ | GEMV | 矩阵-向量乘法 |
 | ⬜ | Softmax | Softmax 计算 |
 | ⬜ | Softmax (Warp) | Warp 级 Softmax |
 | ⬜ | Layernorm | 层归一化 |
@@ -72,7 +71,6 @@ toykernel/
 └── src/
     ├── level1/              # 基础算子
     │   ├── vector_ops.cu
-    │   ├── gemv.cu
     │   ├── softmax.cu
     │   ├── norm.cu
     │   └── activation.cu
