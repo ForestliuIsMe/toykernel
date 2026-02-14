@@ -1,6 +1,9 @@
 # CUDA
 *.cu
 *.cuh
+!src/**/*.cu
+!include/**/*.cu
+!include/*.cuh
 *.ptx
 *.fatbin
 
