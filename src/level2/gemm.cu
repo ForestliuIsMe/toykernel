@@ -47,19 +47,20 @@ __global__ void gemm_naive_kernel(const float* A, const float* B, float* C,
 // input A is col major
 // input B is row major
 // first dimision is always K
-// M_SUB_BLOCKS : 一个block内一个warp需要在m方向做几次mma
-// N_SUB_BLOCKS : 一个block内一个warp需要在n方向做几次mma
-// K_SUB_BLOCKS : 一个block内一个warp需要在k方向做几次mma
-template<int M_BLOCK_SIZE, int N_BLOCK_SIZE, int K_BLOCK_SIZE, 
-        int M_MMA_SIZE, int N_MMA_SIZE, int K_MMA_SIZE,
-        int M_SUB_BLOCKS, int N_SUB_BLOCKS, int K_SUB_BLOCKS>
+// M_MMA_ITERA : 一个block内一个warp需要在m方向做几次mma
+// N_MMA_ITERA : 一个block内一个warp需要在n方向做几次mma
+// K_MMA_ITERA : 一个block内一个warp需要在k方向做几次mma
+template<int M_BLOCK_SIZE, int N_BLOCK_SIZE, int K_BLOCK_SIZE,
+        int M_MMA_ITERA, int N_MMA_ITERA, int K_MMA_ITERA>
 __global__ void gemm_sliced_k(const half* A, const half* B, half* C,
                                    int M, int N, int K){
     const int THREAD_NUM = threadDim.x;
-
+    const int M_SUB_BLOCKS = M_BLOCK_SIZE / (16 * M_MMA_ITERA);
+    const int N_SUB_BLOCKS = N_BLOCK_SIZE / (8  * N_MMA_ITERA);
+    const int K_SUB_BLOCKS = K_BLOCK_SIZE / (16 * K_MMA_ITERA);
     // each warp should do mma along the K first
     // along the K can reduce by mma operator
-    
+
     const int wid = WARP_ID();
     const int lid = LANE_ID();
     const int bx = blockIdx.x;
@@ -67,27 +68,120 @@ __global__ void gemm_sliced_k(const half* A, const half* B, half* C,
 
     __shared__ half sA[K_BLOCK_SIZE][M_BLOCK_SIZE];
     __shared__ half sB[K_BLOCK_SIZE][N_BLOCK_SIZE];
-    
-    A = A + OFFSET2D(0, M_BLOCK_SIZE * bx , M);
-    B = B + OFFSET2D(0, N_BLOCK_SIZE * by , N);
 
-    uint32_t a[M_SUB_BLOCKS][N_SUB_BLOCKS][4];  // m16n8k16
-    uint32_t b[M_SUB_BLOCKS][N_SUB_BLOCKS][2];
-    uint32_t c[M_SUB_BLOCKS][N_SUB_BLOCKS][2];  // TODO: reset to zero
+    __shared__ half sC[M_BLOCK_SIZE][N_BLOCK_SIZE];
+
+    A = A + OFFSET2D(0, M_BLOCK_SIZE * by , M);
+    B = B + OFFSET2D(0, N_BLOCK_SIZE * bx , N);
+
+    // MMA registers
+    // a[mm][nn]: A matrix fragment for sub-block (mm, nn)
+    // b[mm][nn]: B matrix fragment for sub-block (mm, nn)
+    // c[mm][nn]: Accumulator for sub-block (mm, nn)
+    uint32_t a[M_MMA_ITERA][N_MMA_ITERA][4];  // m16n8k16: 4 registers per fragment
+    uint32_t b[M_MMA_ITERA][N_MMA_ITERA][2];  // 2 registers per fragment
+    uint32_t c[M_MMA_ITERA][N_MMA_ITERA][2];  // Accumulator registers
+
+    // Initialize accumulator to zero
+    #pragma unroll
+    for (int mm = 0; mm < M_MMA_ITERA; mm++) {
+        #pragma unroll
+        for (int nn = 0; nn < N_MMA_ITERA; nn++) {
+            c[mm][nn][0] = 0;
+            c[mm][nn][1] = 0;
+        }
+    }
+
+    // Determine which sub-block this thread/warp is responsible for
+    // Each warp handles multiple sub-blocks based on wid
+    int k_sub_block_id = wid % K_MMA_ITERA;
+    int n_sub_block_id = wid / K_MMA_ITERA % n_sub_block_id; 
+    int m_sub_block_id = wid / K_MMA_ITERA % m_sub_block_id;
+
     for(int k = 0; k < K; k += K_BLOCK_SIZE){
         // deal with [M_BLOCK_SIZE,K_BLOCK_SIZE,N_BLOCK_SIZE]
         // each warp use m16n8k16
-        for(int mm = 0; mm < M_SUB_BLOCKS; mm++){
-            for(int nn = 0; nn < N_SUB_BLOCKS, nn++){
-                for(int kk = 0; kk < K_SUB_BLOCKS, kk++){
-                    // TODO: determin which sub block calculate here.
-                    mma(M_MMA_SIZE,N_MMA_SIZE,K_MMA_SIZE,a[mm][nn],b[mm][nn],c[mm][nn]);
+
+        // TODO: Load A & B tile into shared memory
+         
+        __syncthreads();
+
+
+        half* subblock_A = &(sA[k_sub_block_id * 16][m_sub_block_id * 16]);
+        half* subblock_B = &(sB[k_sub_block_id * 16][n_sub_block_id * 8]);
+
+        // Perform MMA for each sub-block
+        for(int mm = 0 ; mm < M_MMA_ITERA; mm++){
+            for(int nn = 0; nn < N_MMA_ITERA; nn++){
+                for(int kk = 0; kk < K_MMA_ITERA; kk++){
+                    half* mma_block_A = subblock_A + OFFSET2D(kk * 16,mm * 16,M_BLOCK_SIZE);
+                    half* mma_block_B = subblock_B + OFFSET2D(kk * 16,nn * 8,N_BLOCK_SIZE);
+
+                    // ldmatrix and calculate mma
                 }
             }
         }
+        __syncthreads();
     }
-    // TODO: reduce in K
-    // epiloge: use shared memory relayout
+
+    // Epilogue: store result to global memory
+    // Need to relayout accumulator to match global memory layout
+
+    // Determine output position for this warp
+
+    int c_row_base = by * M_BLOCK_SIZE + m_sub_block_id * 16;
+    int c_col_base = bx * N_BLOCK_SIZE + n_sub_block_id * 8;
+    
+    // Store each sub-block result
+    #pragma unroll
+    for (int mm = 0; mm < M_MMA_ITERA; mm++) {
+        #pragma unroll
+        for (int nn = 0; nn < N_MMA_ITERA; nn++) {
+            int c_row = c_row_base + mm * 16;
+            int c_col = c_col_base + nn * 8;
+
+            // Convert accumulator to half and store
+            // Each thread stores its portion
+            half* c_ptr = &sC[OFFSET2D(c_row, c_col, N)];
+
+            // Store using stmatrix or regular store
+            // Here we use regular store for simplicity
+            
+            half c_half_reg[2];
+            // only support for m16n8k16
+            *reinterpret_cast<uint32_t*>(&c_half_reg[0]) = c[mm][nn][0];
+            // TODO: atomic add instead of add
+            // c0
+            c_ptr[OFFSET2D(lid / 4, (lid % 4) * 2, N)]      += c_half_reg[0];
+            c_ptr[OFFSET2D(lid / 4, (lid % 4) * 2 + 1, N)]  += c_half_reg[0];
+
+            *reinterpret_cast<uint32_t*>(&c_half_reg[0]) = c[mm][nn][1];
+            // c1
+            c_ptr[OFFSET2D(lid / 4, (lid % 4) * 2, N)]      += c_half_reg[0];
+            c_ptr[OFFSET2D(lid / 4, (lid % 4) * 2 + 1, N)]  += c_half_reg[0];
+        
+            __syncthreads();
+        }
+    }
+
+    // write back
+    int transaction_c_size = (M_BLOCK_SIZE * N_BLOCK_SIZE * sizeof(half));
+
+    C_block = C + OFFSET2D(M_BLOCK_SIZE * by, N_BLOCK_SIZE * bx, N_BLOCK_SIZE);
+
+    for(int i = 0; i < transaction_c_size; i += 128 * threadDim.x){
+        if(transaction_c_size - i > 128 * threadDim.x){
+            // TODO: vec4 u32 write out
+            
+        }else{
+            // TODO: else
+        }
+    }
+
+
+
+
+
 }
 
 
