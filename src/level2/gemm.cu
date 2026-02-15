@@ -1,6 +1,6 @@
 /**
  * @file gemm.cu
- * @brief Naive General Matrix Multiplication (GEMM)
+ * @brief General Matrix Multiplication (GEMM)
  *
  * Implements C = alpha * A * B + beta * C where:
  * - A is an M x K matrix
@@ -18,16 +18,23 @@
 #include "utils.cuh"
 
 /**
- * @brief Naive GEMM kernel
- * Each thread computes one element of C
- * @param A Matrix A (M x K)
- * @param B Matrix B (K x N)
- * @param C Output matrix C (M x N)
- * @param M Rows of A and C
- * @param N Columns of B and C
- * @param K Columns of A and rows of B
- * @param alpha Scalar multiplier
- * @param beta Scalar for existing C
+ * @brief Naive GEMM kernel: C = alpha * A * B + beta * C
+ *
+ * All matrices are stored in row-major layout:
+ * - A: row-major, dimensions M x K, stride = K
+ * - B: row-major, dimensions K x N, stride = N
+ * - C: row-major, dimensions M x N, stride = N
+ *
+ * Each thread computes one element of C.
+ *
+ * @param A Matrix A (M x K, row-major)
+ * @param B Matrix B (K x N, row-major)
+ * @param C Output matrix C (M x N, row-major)
+ * @param M Number of rows in A and C
+ * @param N Number of columns in B and C
+ * @param K Number of columns in A and rows in B
+ * @param alpha Scalar multiplier for A*B
+ * @param beta Scalar multiplier for existing C
  */
 __global__ void gemm_naive_kernel(const float* A, const float* B, float* C,
                                    int M, int N, int K, float alpha, float beta) {
@@ -44,20 +51,37 @@ __global__ void gemm_naive_kernel(const float* A, const float* B, float* C,
     C[row * N + col] = alpha * sum + beta * C[row * N + col];
 }
 
-// input A is col major
-// input B is row major
-// first dimision is always K
-// 使用m16k16n8的mma指令
-// M_MMA_ITERA : 一个block内一个warp需要在m方向做几次mma
-// N_MMA_ITERA : 一个block内一个warp需要在n方向做几次mma
-// K_MMA_ITERA : 一个block内一个warp需要在k方向做几次mma
-// 制定block size之后，需要规定三个重要参数： M_MMA_ITERA, N_MMA_ITERA, K_MMA_ITERA
-// 一般来说，需要满足以下constrain：  WARP_NUM = min(M_SUB_BLOCKS * K_SUB_BLOCKS, N_SUB_BLOCKS * K_SUB_BLOCKS)
-// 所以根据规定的M_BLOCK_SIZE, N_BLOCK_SIZE和K_BLOCK_SIZE 是可以推断出合适的M_MMA_ITERA，N_MMA_ITERA， K_MMA_ITRERA以及WARP_NUM的组合关系的
-// 至于grid的形状，则按输入的M，N和M_BLOCK_SIZE，N_BLOCK_SIZE来区分。
+/**
+ * @brief Sliced-K GEMM kernel using Tensor Core MMA: C = A * B
+ *
+ * Storage layout:
+ * - A: col-major, dimensions M x K, stride = M (leading dimension)
+ * - B: row-major, dimensions K x N, stride = N
+ * - C: row-major, dimensions M x N, stride = N
+ *
+ * Uses m16n8k16 MMA instruction (M=16, N=8, K=16) via PTX.
+ *
+ * Template parameters:
+ * @tparam M_BLOCK_SIZE Block size in M dimension
+ * @tparam N_BLOCK_SIZE Block size in N dimension
+ * @tparam K_BLOCK_SIZE Block size in K dimension (sliced)
+ * @tparam M_MMA_ITERA  Number of MMA iterations in M per warp
+ * @tparam N_MMA_ITERA  Number of MMA iterations in N per warp
+ * @tparam K_MMA_ITERA  Number of MMA iterations in K per warp
+ *
+ * Constraint: WARP_NUM = min(M_SUB_BLOCKS * K_SUB_BLOCKS, N_SUB_BLOCKS * K_SUB_BLOCKS)
+ * where M_SUB_BLOCKS = M_BLOCK_SIZE / (16 * M_MMA_ITERA), etc.
+ *
+ * @param A Input matrix A (M x K, col-major)
+ * @param B Input matrix B (K x N, row-major)
+ * @param C Output matrix C (M x N, row-major)
+ * @param M Number of rows in A and C
+ * @param N Number of columns in B and C
+ * @param K Number of columns in A and rows in B
+ */
 template<int M_BLOCK_SIZE, int N_BLOCK_SIZE, int K_BLOCK_SIZE,
         int M_MMA_ITERA, int N_MMA_ITERA, int K_MMA_ITERA>
-__global__ void gemm_sliced_k(const half* A, const half* B, half* C,
+__global__ void gemm_sliced_k_kernel(const half* A, const half* B, half* C,
                                    int M, int N, int K){
     const int THREAD_NUM = blockDim.x;
     const int tid = threadIdx.x;
@@ -288,7 +312,7 @@ void gemm_sliced_k(const half* A, const half* B, half* C, int M, int N, int K) {
         dim3 block(WARP_NUM * 32);  // 256 threads
         dim3 grid((N + N_BLOCK - 1) / N_BLOCK, (M + M_BLOCK - 1) / M_BLOCK);
 
-        gemm_sliced_k<M_BLOCK, N_BLOCK, K_BLOCK, M_MMA_IT, N_MMA_IT, K_MMA_IT>
+        gemm_sliced_k_kernel<M_BLOCK, N_BLOCK, K_BLOCK, M_MMA_IT, N_MMA_IT, K_MMA_IT>
             <<<grid, block>>>(A, B, C, M, N, K);
     } else if (M >= 64 && N >= 64) {
         // Medium matrices: 64x64x32
@@ -303,7 +327,7 @@ void gemm_sliced_k(const half* A, const half* B, half* C, int M, int N, int K) {
         dim3 block(WARP_NUM * 32);
         dim3 grid((N + N_BLOCK - 1) / N_BLOCK, (M + M_BLOCK - 1) / M_BLOCK);
 
-        gemm_sliced_k<M_BLOCK, N_BLOCK, K_BLOCK, M_MMA_IT, N_MMA_IT, K_MMA_IT>
+        gemm_sliced_k_kernel<M_BLOCK, N_BLOCK, K_BLOCK, M_MMA_IT, N_MMA_IT, K_MMA_IT>
             <<<grid, block>>>(A, B, C, M, N, K);
     } else if (M >= 64 && N >= 32) {
         // Small-Medium matrices: 64x32x32
@@ -318,7 +342,7 @@ void gemm_sliced_k(const half* A, const half* B, half* C, int M, int N, int K) {
         dim3 block(WARP_NUM * 32);
         dim3 grid((N + N_BLOCK - 1) / N_BLOCK, (M + M_BLOCK - 1) / M_BLOCK);
 
-        gemm_sliced_k<M_BLOCK, N_BLOCK, K_BLOCK, M_MMA_IT, N_MMA_IT, K_MMA_IT>
+        gemm_sliced_k_kernel<M_BLOCK, N_BLOCK, K_BLOCK, M_MMA_IT, N_MMA_IT, K_MMA_IT>
             <<<grid, block>>>(A, B, C, M, N, K);
     } else {
         // Small matrices: 32x32x32
@@ -333,7 +357,7 @@ void gemm_sliced_k(const half* A, const half* B, half* C, int M, int N, int K) {
         dim3 block(WARP_NUM * 32);
         dim3 grid((N + N_BLOCK - 1) / N_BLOCK, (M + M_BLOCK - 1) / M_BLOCK);
 
-        gemm_sliced_k<M_BLOCK, N_BLOCK, K_BLOCK, M_MMA_IT, N_MMA_IT, K_MMA_IT>
+        gemm_sliced_k_kernel<M_BLOCK, N_BLOCK, K_BLOCK, M_MMA_IT, N_MMA_IT, K_MMA_IT>
             <<<grid, block>>>(A, B, C, M, N, K);
     }
     CUDA_KERNEL_CHECK();
