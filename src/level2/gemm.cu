@@ -47,6 +47,7 @@ __global__ void gemm_naive_kernel(const float* A, const float* B, float* C,
 // input A is col major
 // input B is row major
 // first dimision is always K
+// 使用m16k16n8的mma指令
 // M_MMA_ITERA : 一个block内一个warp需要在m方向做几次mma
 // N_MMA_ITERA : 一个block内一个warp需要在n方向做几次mma
 // K_MMA_ITERA : 一个block内一个warp需要在k方向做几次mma
@@ -95,15 +96,34 @@ __global__ void gemm_sliced_k(const half* A, const half* B, half* C,
     // Determine which sub-block this thread/warp is responsible for
     // Each warp handles multiple sub-blocks based on wid
     int k_sub_block_id = wid % K_MMA_ITERA;
-    int n_sub_block_id = wid / K_MMA_ITERA % n_sub_block_id; 
-    int m_sub_block_id = wid / K_MMA_ITERA % m_sub_block_id;
+    int n_sub_block_id = wid / K_MMA_ITERA % N_SUB_BLOCKS;
+    int m_sub_block_id = wid / (K_MMA_ITERA * N_SUB_BLOCKS) % M_SUB_BLOCKS;
 
     for(int k = 0; k < K; k += K_BLOCK_SIZE){
         // deal with [M_BLOCK_SIZE,K_BLOCK_SIZE,N_BLOCK_SIZE]
         // each warp use m16n8k16
 
-        // TODO: Load A & B tile into shared memory
-         
+        // Load A tile into shared memory
+        // Cooperative loading: each thread loads elements
+        #pragma unroll
+        for (int i = 0; i < K_BLOCK_SIZE; i++) {
+            int a_row = k + i;
+            int a_col = tid;
+            if (a_row < K && a_col < M_BLOCK_SIZE) {
+                sA[i][a_col] = A[OFFSET2D(a_row, a_col, M)];
+            }
+        }
+
+        // Load B tile into shared memory
+        #pragma unroll
+        for (int i = 0; i < K_BLOCK_SIZE; i++) {
+            int b_row = k + i;
+            int b_col = tid;
+            if (b_row < K && b_col < N_BLOCK_SIZE) {
+                sB[i][b_col] = B[OFFSET2D(b_row, b_col, N)];
+            }
+        }
+
         __syncthreads();
 
 
@@ -114,10 +134,27 @@ __global__ void gemm_sliced_k(const half* A, const half* B, half* C,
         for(int mm = 0 ; mm < M_MMA_ITERA; mm++){
             for(int nn = 0; nn < N_MMA_ITERA; nn++){
                 for(int kk = 0; kk < K_MMA_ITERA; kk++){
-                    half* mma_block_A = subblock_A + OFFSET2D(kk * 16,mm * 16,M_BLOCK_SIZE);
-                    half* mma_block_B = subblock_B + OFFSET2D(kk * 16,nn * 8,N_BLOCK_SIZE);
+                    half* mma_block_A = subblock_A + OFFSET2D(kk * 16, mm * 16, M_BLOCK_SIZE);
+                    half* mma_block_B = subblock_B + OFFSET2D(kk * 16, nn * 8, N_BLOCK_SIZE);
 
-                    // ldmatrix and calculate mma
+                    // Load A fragment using ldmatrix
+                    // Each thread loads 8 consecutive elements
+                    uint32_t a_frag[4];
+                    ldmatrix.sync.aligned.m8n8.x4(a_frag, mma_block_A);
+
+                    // Load B fragment using ldmatrix
+                    uint32_t b_frag[2];
+                    ldmatrix.sync.aligned.m8n8.x1(b_frag, mma_block_B);
+
+                    // Perform MMA: c = a * b + c
+                    // m16n8k16: 16 rows x 8 cols output
+                    uint32_t c_frag[2] = {c[mm][nn][0], c[mm][nn][1]};
+                    mma.sync.aligned.m16n8k16.f16.f16.f16.f16(
+                        c[mm][nn][0], c[mm][nn][1],
+                        a_frag[0], a_frag[1], a_frag[2], a_frag[3],
+                        b_frag[0], b_frag[1],
+                        c_frag[0], c_frag[1]
+                    );
                 }
             }
         }
@@ -142,23 +179,21 @@ __global__ void gemm_sliced_k(const half* A, const half* B, half* C,
 
             // Convert accumulator to half and store
             // Each thread stores its portion
-            half* c_ptr = &sC[OFFSET2D(c_row, c_col, N)];
+            half* c_ptr = &sC[OFFSET2D(c_row, c_col, N_BLOCK_SIZE)];
 
-            // Store using stmatrix or regular store
-            // Here we use regular store for simplicity
-            
+            // Store using atomic add for multiple warps writing to same location
             half c_half_reg[2];
             // only support for m16n8k16
             *reinterpret_cast<uint32_t*>(&c_half_reg[0]) = c[mm][nn][0];
-            // TODO: atomic add instead of add
+            // Use atomic add for correctness when multiple warps write to same location
             // c0
-            c_ptr[OFFSET2D(lid / 4, (lid % 4) * 2, N)]      += c_half_reg[0];
-            c_ptr[OFFSET2D(lid / 4, (lid % 4) * 2 + 1, N)]  += c_half_reg[0];
+            atomicAdd(reinterpret_cast<half*>(&c_ptr[OFFSET2D(lid / 4, (lid % 4) * 2, N_BLOCK_SIZE)]), c_half_reg[0]);
+            atomicAdd(reinterpret_cast<half*>(&c_ptr[OFFSET2D(lid / 4, (lid % 4) * 2 + 1, N_BLOCK_SIZE)]), c_half_reg[0]);
 
             *reinterpret_cast<uint32_t*>(&c_half_reg[0]) = c[mm][nn][1];
             // c1
-            c_ptr[OFFSET2D(lid / 4, (lid % 4) * 2, N)]      += c_half_reg[0];
-            c_ptr[OFFSET2D(lid / 4, (lid % 4) * 2 + 1, N)]  += c_half_reg[0];
+            atomicAdd(reinterpret_cast<half*>(&c_ptr[OFFSET2D(lid / 4, (lid % 4) * 2, N_BLOCK_SIZE)]), c_half_reg[0]);
+            atomicAdd(reinterpret_cast<half*>(&c_ptr[OFFSET2D(lid / 4, (lid % 4) * 2 + 1, N_BLOCK_SIZE)]), c_half_reg[0]);
         
             __syncthreads();
         }
@@ -167,21 +202,18 @@ __global__ void gemm_sliced_k(const half* A, const half* B, half* C,
     // write back
     int transaction_c_size = (M_BLOCK_SIZE * N_BLOCK_SIZE * sizeof(half));
 
-    C_block = C + OFFSET2D(M_BLOCK_SIZE * by, N_BLOCK_SIZE * bx, N_BLOCK_SIZE);
+    const half* C_block = C + OFFSET2D(M_BLOCK_SIZE * by, N_BLOCK_SIZE * bx, N);
 
-    for(int i = 0; i < transaction_c_size; i += 128 * threadDim.x){
-        if(transaction_c_size - i > 128 * threadDim.x){
-            // TODO: vec4 u32 write out
-            
-        }else{
-            // TODO: else
+    // Cooperative store: all threads write their portion
+    #pragma unroll
+    for (int i = 0; i < M_BLOCK_SIZE * N_BLOCK_SIZE; i += THREAD_NUM) {
+        int idx = tid + i;
+        if (idx < M_BLOCK_SIZE * N_BLOCK_SIZE) {
+            int row = idx / N_BLOCK_SIZE;
+            int col = idx % N_BLOCK_SIZE;
+            C_block[OFFSET2D(row, col, N)] = sC[row][col];
         }
     }
-
-
-
-
-
 }
 
 
