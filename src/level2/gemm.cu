@@ -245,67 +245,6 @@ __global__ void gemm_sliced_k(const half* A, const half* B, half* C,
     }
 }
 
-/**
- * @brief Shared memory tiled GEMM
- * Uses shared memory for block-level caching
- * @param A Matrix A (M x K)
- * @param B Matrix B (K x N)
- * @param C Output matrix C (M x N)
- * @param M Rows of A and C
- * @param N Columns of B and C
- * @param K Columns of A and rows of B
- * @param alpha Scalar multiplier
- * @param beta Scalar for existing C
- */
-__global__ void gemm_tiled_kernel(const float* A, const float* B, float* C,
-                                    int M, int N, int K, float alpha, float beta) {
-    const int BLOCK_SIZE = 16;
-
-    __shared__ float As[BLOCK_SIZE][BLOCK_SIZE];
-    __shared__ float Bs[BLOCK_SIZE][BLOCK_SIZE];
-
-    int bx = blockIdx.x;
-    int by = blockIdx.y;
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-
-    int row = by * BLOCK_SIZE + ty;
-    int col = bx * BLOCK_SIZE + tx;
-
-    float sum = 0.0f;
-
-    // Loop over K tiles
-    for (int m = 0; m < K; m += BLOCK_SIZE) {
-        // Load A into shared memory
-        if (row < M && (m + tx) < K) {
-            As[ty][tx] = A[row * K + m + tx];
-        } else {
-            As[ty][tx] = 0.0f;
-        }
-
-        // Load B into shared memory
-        if (col < N && (m + ty) < K) {
-            Bs[ty][tx] = B[(m + ty) * N + col];
-        } else {
-            Bs[ty][tx] = 0.0f;
-        }
-
-        __syncthreads();
-
-        // Compute partial dot product
-        for (int k = 0; k < BLOCK_SIZE; ++k) {
-            sum += As[ty][k] * Bs[k][tx];
-        }
-
-        __syncthreads();
-    }
-
-    // Write result
-    if (row < M && col < N) {
-        C[row * N + col] = alpha * sum + beta * C[row * N + col];
-    }
-}
-
 // Wrapper functions
 void gemm_naive(const float* A, const float* B, float* C,
                 int M, int N, int K, float alpha = 1.0f, float beta = 0.0f) {
@@ -315,10 +254,87 @@ void gemm_naive(const float* A, const float* B, float* C,
     CUDA_KERNEL_CHECK();
 }
 
-void gemm_tiled(const float* A, const float* B, float* C,
-                int M, int N, int K, float alpha = 1.0f, float beta = 0.0f) {
-    dim3 block(16, 16);
-    dim3 grid((N + 15) / 16, (M + 15) / 16);
-    gemm_tiled_kernel<<<grid, block>>>(A, B, C, M, N, K, alpha, beta);
+/**
+ * @brief GEMM sliced-k wrapper with auto-selected parameters
+ *
+ * Based on the kernel constraints:
+ * - MMA instruction: m16n8k16 (M=16, N=8, K=16)
+ * - From kernel warp assignment:
+ *     k_sub_block_id = wid % K_SUB_BLOCKS
+ *     n_sub_block_id = (wid / K_SUB_BLOCKS) % N_SUB_BLOCKS
+ *     m_sub_block_id = (wid / K_SUB_BLOCKS) % M_SUB_BLOCKS
+ *   where:
+ *     M_SUB_BLOCKS = M_BLOCK_SIZE / (16 * M_MMA_ITERA)
+ *     N_SUB_BLOCKS = N_BLOCK_SIZE / (8 * N_MMA_ITERA)
+ *     K_SUB_BLOCKS = K_BLOCK_SIZE / (16 * K_MMA_ITERA)
+ *
+ * This wrapper automatically selects optimal parameters based on matrix dimensions.
+ */
+void gemm_sliced_k(const half* A, const half* B, half* C, int M, int N, int K) {
+    // Configuration selection based on matrix dimensions
+    // Strategy: Set K_SUB_BLOCKS=1, then we need WARP_NUM >= max(M_SUB_BLOCKS, N_SUB_BLOCKS)
+    // since both m_sub_block_id and n_sub_block_id use (wid / K_SUB_BLOCKS) = wid
+
+    if (M >= 128 && N >= 64) {
+        // Large matrices: 128x64x32
+        // M_MMA_IT=2: M_SUB = 128/(16*2) = 4
+        // N_MMA_IT=2: N_SUB = 64/(8*2) = 4
+        // K_MMA_IT=2: K_SUB = 32/(16*2) = 1
+        // Need WARP_NUM >= max(4, 4) = 4, use 8 for better occupancy
+        const int M_BLOCK = 128, N_BLOCK = 64, K_BLOCK = 32;
+        const int M_MMA_IT = 2, N_MMA_IT = 2, K_MMA_IT = 2;
+        const int WARP_NUM = 8;
+
+        dim3 block(WARP_NUM * 32);  // 256 threads
+        dim3 grid((N + N_BLOCK - 1) / N_BLOCK, (M + M_BLOCK - 1) / M_BLOCK);
+
+        gemm_sliced_k<M_BLOCK, N_BLOCK, K_BLOCK, M_MMA_IT, N_MMA_IT, K_MMA_IT>
+            <<<grid, block>>>(A, B, C, M, N, K);
+    } else if (M >= 64 && N >= 64) {
+        // Medium matrices: 64x64x32
+        // M_MMA_IT=2: M_SUB = 64/(16*2) = 2
+        // N_MMA_IT=2: N_SUB = 64/(8*2) = 4
+        // K_MMA_IT=2: K_SUB = 32/(16*2) = 1
+        // Need WARP_NUM >= max(2, 4) = 4, use 8 for better occupancy
+        const int M_BLOCK = 64, N_BLOCK = 64, K_BLOCK = 32;
+        const int M_MMA_IT = 2, N_MMA_IT = 2, K_MMA_IT = 2;
+        const int WARP_NUM = 8;
+
+        dim3 block(WARP_NUM * 32);
+        dim3 grid((N + N_BLOCK - 1) / N_BLOCK, (M + M_BLOCK - 1) / M_BLOCK);
+
+        gemm_sliced_k<M_BLOCK, N_BLOCK, K_BLOCK, M_MMA_IT, N_MMA_IT, K_MMA_IT>
+            <<<grid, block>>>(A, B, C, M, N, K);
+    } else if (M >= 64 && N >= 32) {
+        // Small-Medium matrices: 64x32x32
+        // M_MMA_IT=2: M_SUB = 64/(16*2) = 2
+        // N_MMA_IT=1: N_SUB = 32/(8*1) = 4
+        // K_MMA_IT=2: K_SUB = 32/(16*2) = 1
+        // Need WARP_NUM >= max(2, 4) = 4, use 8 for better occupancy
+        const int M_BLOCK = 64, N_BLOCK = 32, K_BLOCK = 32;
+        const int M_MMA_IT = 2, N_MMA_IT = 1, K_MMA_IT = 2;
+        const int WARP_NUM = 8;
+
+        dim3 block(WARP_NUM * 32);
+        dim3 grid((N + N_BLOCK - 1) / N_BLOCK, (M + M_BLOCK - 1) / M_BLOCK);
+
+        gemm_sliced_k<M_BLOCK, N_BLOCK, K_BLOCK, M_MMA_IT, N_MMA_IT, K_MMA_IT>
+            <<<grid, block>>>(A, B, C, M, N, K);
+    } else {
+        // Small matrices: 32x32x32
+        // M_MMA_IT=1: M_SUB = 32/16 = 2
+        // N_MMA_IT=2: N_SUB = 32/16 = 2
+        // K_MMA_IT=2: K_SUB = 32/32 = 1
+        // Need WARP_NUM >= max(2, 2) = 2, use 4 for better parallelism
+        const int M_BLOCK = 32, N_BLOCK = 32, K_BLOCK = 32;
+        const int M_MMA_IT = 1, N_MMA_IT = 2, K_MMA_IT = 2;
+        const int WARP_NUM = 4;
+
+        dim3 block(WARP_NUM * 32);
+        dim3 grid((N + N_BLOCK - 1) / N_BLOCK, (M + M_BLOCK - 1) / M_BLOCK);
+
+        gemm_sliced_k<M_BLOCK, N_BLOCK, K_BLOCK, M_MMA_IT, N_MMA_IT, K_MMA_IT>
+            <<<grid, block>>>(A, B, C, M, N, K);
+    }
     CUDA_KERNEL_CHECK();
 }
