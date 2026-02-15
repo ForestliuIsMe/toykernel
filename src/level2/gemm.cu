@@ -44,6 +44,53 @@ __global__ void gemm_naive_kernel(const float* A, const float* B, float* C,
     C[row * N + col] = alpha * sum + beta * C[row * N + col];
 }
 
+// input A is col major
+// input B is row major
+// first dimision is always K
+// M_SUB_BLOCKS : 一个block内一个warp需要在m方向做几次mma
+// N_SUB_BLOCKS : 一个block内一个warp需要在n方向做几次mma
+// K_SUB_BLOCKS : 一个block内一个warp需要在k方向做几次mma
+template<int M_BLOCK_SIZE, int N_BLOCK_SIZE, int K_BLOCK_SIZE, 
+        int M_MMA_SIZE, int N_MMA_SIZE, int K_MMA_SIZE,
+        int M_SUB_BLOCKS, int N_SUB_BLOCKS, int K_SUB_BLOCKS>
+__global__ void gemm_sliced_k(const half* A, const half* B, half* C,
+                                   int M, int N, int K){
+    const int THREAD_NUM = threadDim.x;
+
+    // each warp should do mma along the K first
+    // along the K can reduce by mma operator
+    
+    const int wid = WARP_ID();
+    const int lid = LANE_ID();
+    const int bx = blockIdx.x;
+    const int by = blockIdx.y;
+
+    __shared__ half sA[K_BLOCK_SIZE][M_BLOCK_SIZE];
+    __shared__ half sB[K_BLOCK_SIZE][N_BLOCK_SIZE];
+    
+    A = A + OFFSET2D(0, M_BLOCK_SIZE * bx , M);
+    B = B + OFFSET2D(0, N_BLOCK_SIZE * by , N);
+
+    uint32_t a[M_SUB_BLOCKS][N_SUB_BLOCKS][4];  // m16n8k16
+    uint32_t b[M_SUB_BLOCKS][N_SUB_BLOCKS][2];
+    uint32_t c[M_SUB_BLOCKS][N_SUB_BLOCKS][2];  // TODO: reset to zero
+    for(int k = 0; k < K; k += K_BLOCK_SIZE){
+        // deal with [M_BLOCK_SIZE,K_BLOCK_SIZE,N_BLOCK_SIZE]
+        // each warp use m16n8k16
+        for(int mm = 0; mm < M_SUB_BLOCKS; mm++){
+            for(int nn = 0; nn < N_SUB_BLOCKS, nn++){
+                for(int kk = 0; kk < K_SUB_BLOCKS, kk++){
+                    // TODO: determin which sub block calculate here.
+                    mma(M_MMA_SIZE,N_MMA_SIZE,K_MMA_SIZE,a[mm][nn],b[mm][nn],c[mm][nn]);
+                }
+            }
+        }
+    }
+    // TODO: reduce in K
+    // epiloge: use shared memory relayout
+}
+
+
 /**
  * @brief Shared memory tiled GEMM
  * Uses shared memory for block-level caching
