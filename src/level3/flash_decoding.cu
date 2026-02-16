@@ -19,7 +19,7 @@
 
 // Q : [heads, head_dim, 1]         : float32
 // K : [heads, head_dim / 4, seq, 4] : float32    // borrow 4 from seqs
-// V : [heads, head_dim / 4, seq, 4]
+// V : [heads, head_dim , seq]
 // O : [heads, head_dim, 1]
 template<int HEAD_DIM, int THREAD_NUM>
 __global__ void flash_decoding_gemv(
@@ -37,10 +37,16 @@ __global__ void flash_decoding_gemv(
     int token_per_thread = (seq_len + thread_num - 1) / thread_num;
 
     __shared__ float sQ[HEAD_DIM];
-    __shared__ float sL[THREAD_NUM];
 
-    __shared__ float sO[HEAD_DIM];
-    __shared__ float sMax[HEAD_DIM];
+    __shared__ float sS[]; // extern seq_len
+
+    __shared__ bool need_recalculate;
+
+    if(tid == 0){
+        need_recalculate = false;
+    }
+    __syncthreads();
+
 
     // Each head's offset
     Q = Q + head_id * q_head_stride;
@@ -72,7 +78,8 @@ __global__ void flash_decoding_gemv(
     // warp是按照seq分的，思路没问题
     // 问题是S=QK 也是seq，这个seq做reduce会很麻烦
     float l = 1.0f;
-    
+    float max_kq = unified_max;
+
     for(int token = tid; token < seq_len; token += thread_num){
         float o = 0.0f;
         float kq = 0.0f;
@@ -86,54 +93,39 @@ __global__ void flash_decoding_gemv(
                         + k_local.z * q_local.z
                         + k_local.w * q_local.w;
         }
+
+        sS[token] = kq - unified_max; // logits
         
+        float max_kq = unified_max;
+
         float safe_kq = kq - unified_max;
-        int pred = (safe_kq > 88.0f) ? 1 : 0;
-        // warp 内任意线程的 pred 为真，则返回非零
-        int need_recalculate = __any_sync(0xffffffff, pred);
-
-        // thread diverge
-        if(need_recalculate){
-            // illegal value, need to recalucalte softmax 
-            // update old one
-
-            float new_unified_max = warp_reduce_max<float>(kq) - 88.0f;
-            // update old
-            safe_kq = kq - new_unified_max;
-            l = l * __expf(unified_max - new_unified_max) + __expf(safe_kq);
-            o = o * __expf(unified_max - new_unified_max);
-            unified_max = new_unified_max;
-
-        }else{
-            l = l + __expf(safe_kq);
+        int pred = (safe_kq > 88.0f) ? 1 : 0;   // overflow
+        if(pred){
+            need_recalculate = true;
         }
-        __syncthreads();
-
-        for(int kk = 0; kk < HEAD_DIM / 4; kk++){
-            int col_offset = token * 4;
-            float4 v_local = CFLOAT4(V[OFFSET2D(kk,col_offset,seq_len * 4)]);
-            o +=  (v_local.x + v_local.y + v_local.z + v_local.w) * __expf(safe_kq); 
-        }
-
-        sO[token] = o;
-        sMax[token] = unified_max;
         __syncthreads();
     }
 
-    // 当前的o是每个token的o，但是还没有除l
-    // 当前的l是每个thread的和
-    // 每个unifiedmax是每个thread的和
-    // 现在需要计算一个整体的l，并且更新每个thread的max，
-    // reduce max
-    max_val = thread_block_reduce_max(unified_max);
-    // update l
-    l = l * __expf(unified_max - max_val);
-    // reduce l
-    l = thread_block_reduce_add(l);
+    // reduce max 
+    if(need_recalculate){
+        max_kq = thread_block_reduce_max<float>(max_kq);
+    }
     
+    float softmax_diff_val = unified_max - max_kq;
+
+    float l = 0.0f;
     for(int token = tid; token < seq_len; token += thread_num){
-        flaot scaler = __expf(sMax - max_val);
-        O[token] = sO[token] * scaler / l;
+        sS[token] = __expf(sS[token] - softmax_diff_val);
+        l += sS[token];
+    }
+
+    float l = thread_block_reduce_add<float>(l);
+
+    for(int token = tid; token < seq_len; token += thread_num){
+        float s = sS[token] / l;
+        for(int kk = 0; kk < HEAD_DIM; kk++){
+            O[kk] += thread_block_reduce_add<float>(s * V[OFFSET2D(kk,token,seq_len)]);
+        }
     }
 }
 
