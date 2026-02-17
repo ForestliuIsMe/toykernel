@@ -38,7 +38,7 @@ __global__ void flash_decoding_gemv(
 
     __shared__ float sQ[HEAD_DIM];
 
-    __shared__ float sS[]; // extern seq_len
+    extern __shared__ float sS[]; // extern seq_len
 
     __shared__ bool need_recalculate;
 
@@ -52,6 +52,7 @@ __global__ void flash_decoding_gemv(
     Q = Q + head_id * q_head_stride;
     K = K + head_id * kv_head_stride;
     V = V + head_id * kv_head_stride;
+    O = O + head_id * q_head_stride;
 
     // memory bodun issue
     // __shared__ float sK[2][THREAD_NUM * 4]; // [2, ]. // buffering head_dim 
@@ -77,7 +78,6 @@ __global__ void flash_decoding_gemv(
     
     // warp是按照seq分的，思路没问题
     // 问题是S=QK 也是seq，这个seq做reduce会很麻烦
-    float l = 1.0f;
     float max_kq = unified_max;
 
     for(int token = tid; token < seq_len; token += thread_num){
@@ -94,15 +94,14 @@ __global__ void flash_decoding_gemv(
                         + k_local.w * q_local.w;
         }
 
-        sS[token] = kq - unified_max; // logits
-        
-        float max_kq = unified_max;
-
         float safe_kq = kq - unified_max;
         int pred = (safe_kq > 88.0f) ? 1 : 0;   // overflow
         if(pred){
             need_recalculate = true;
+            max_kq = kq - 88.0f;
         }
+
+        sS[token] = safe_kq;
         __syncthreads();
     }
 
@@ -110,6 +109,7 @@ __global__ void flash_decoding_gemv(
     if(need_recalculate){
         max_kq = thread_block_reduce_max<float>(max_kq);
     }
+    __syncthreads();
     
     float softmax_diff_val = unified_max - max_kq;
 
@@ -119,11 +119,12 @@ __global__ void flash_decoding_gemv(
         l += sS[token];
     }
 
-    float l = thread_block_reduce_add<float>(l);
+    l = thread_block_reduce_add<float>(l);
 
     for(int token = tid; token < seq_len; token += thread_num){
         float s = sS[token] / l;
         for(int kk = 0; kk < HEAD_DIM; kk++){
+            // no atomic issue, just write
             O[kk] += thread_block_reduce_add<float>(s * V[OFFSET2D(kk,token,seq_len)]);
         }
     }
