@@ -80,7 +80,7 @@ __global__ void flash_decoding_gemv(
     // 问题是S=QK 也是seq，这个seq做reduce会很麻烦
     float max_kq = unified_max;
 
-    for(int token = tid; token < seq_len; token += thread_num){
+    for(int token = tid; token < (seq_len + thread_num - 1) / thread_num; token += thread_num){
         float o = 0.0f;
         float kq = 0.0f;
 
@@ -127,6 +127,19 @@ __global__ void flash_decoding_gemv(
             // no atomic issue, just write
             O[kk] += thread_block_reduce_add<float>(s * V[OFFSET2D(kk,token,seq_len)]);
         }
+    }
+
+    for(int kk = 0; kk < HEAD_DIM; kk++){
+        float val = 0.0f;
+        for(int token = tid; token < seq_len; token+=thread_num){
+            float s = sS[token] / l;
+            val += thread_block_reduce_add<float>(s * V[OFFSET2D(kk,token,seq_len)]);
+        }
+        // write back to kk
+        if(tid == 0){
+            O[kk] = val;
+        }
+        __syncthreads();
     }
 }
 

@@ -20,6 +20,112 @@
 #define BLOCK_SIZE 64
 #define HEAD_DIM 64
 
+
+/*
+    Q: [batch, heads, head_dim, m]
+    K: [batch, heads, head_dim, n]
+    V: [batch, heads, head_dim, n]
+
+    Br is the block size of Qi      integer multiply of 16
+    Bc is the block size of Ki,Vi.  integer multiply of 16
+    CHUNK_SIZE is total seq len of Qi
+    CHUNK_SIZE / (WARP_NUM * Br)   ==> seq dimention iteration number
+*/
+template<int WARP_NUM, int HEAD_DIM, int Bc, int Br, int CHUNK_SIZE>
+__global__ void flash_attention_kernel(
+    const half* __restrict Q,
+    const half* __restrict K,
+    const half* __restrict V,
+    half* O,
+    float softmax_scale,
+    int kv_seq_len,
+    int num_heads
+){
+    int tid = threadIdx.x;
+    int warp_id = WARP_ID();
+    int lane_id = LANE_ID();
+    int warp_num = threadDim.x / 32;
+    int seq_iteration_num = CHUNK_SIZE / (warp_num * Br)
+
+    __shared__ half Ki[Bc * HEAD_DIM];
+    __shared__ half Vi[Bc * HEAD_DIM];
+    __shared__ half Qj[warp_num][Br * HEAD_DIM];
+    __shared__ half Oj[warp_num][Br * HEAD_DIM];
+    
+    __shared__ half Si[WARP_NUM][Br * Bc];
+    __shared__ half RowAjduster[WARP_NUM][Br];
+    __shared__ half RowLi[WARP_NUM][Br];
+
+    for(int j = warp_id * Br; j < CHUNK_SIZE; j += warp_num * Br){
+        // TODO: copy Qj first
+        // Qj copy complete
+        __syncthreads();
+        
+        // inner loop
+        for(int i = 0; i < kv_seq_len; i += Bc){
+        
+            // calculate S = QK
+            for(int m = 0; m < Br ; m += 16){
+                for(int k = 0; k < HEAD_DIM; k+= 16){
+                    // copy Ki
+                    // for each sub k
+                    for(int sub_mma = 0; sub_mma < Bc; sub_mma += 8){
+                        // calculate mma and store data into Si
+                    }
+                }
+            }
+
+            // calculate max
+            // max = max(rowmax(S),oldmax)   \in [Br]
+            // adjuster = expf(oldmax - max)
+            // P*V \in [Br, HEAD_SIZE]
+            // O = O * adjuster + P*V
+            int rows_for_each_thread = Br / 32;
+            half rowmax[rows_for_each_thread] = {-INFINITY};
+            half adjuster[rows_for_each_thread];
+            for(int row = lane_id; row < Br; row += 32){
+                for(int col = 0; col < Bc ; col ++){
+                    rowmax[row / 32] = max(Si[warp_id][Bc * row + col], rowmax[row / 32]);
+                }
+                half max = max(rowmax[row/32], rowmax_old[row/32]);
+                adjuster[row/32] = expf(rowmax_old[row/32] - max);
+
+                half row_sum = 0;
+                for(int col = 0; col < Br; col++){
+                    // P = expf(S - max)
+                    Pi[warp_id][Bc * row + col] = __expf(Si[warp_id][Bc * row + col] - max);
+                    row_sum += Pi[warp_id][Bc * row + row];
+                }
+                
+                for(int col = 0; col < HEAD_SIZE; col++){
+                    Oj[warp_id][HEAD_SIZE * row + col] *= adjuster[row/32];
+                }
+
+                Li[warp_id][row] = Li[warp_id][row] * adjuster[row/32] + row_sum;
+            }
+
+            // update O = O + PV
+            for(int m = 0; m < Br ; m += 16){
+                for(int k = 0; k < Bc; k+= 16){
+                    for(int sub_mma = 0; sub_mma < HEAD_SIZE; sub_mma += 8){
+                        // calculate mma and store data into Si
+
+                    }
+                }
+            }
+
+
+
+
+        }
+    }
+
+
+
+}
+
+
+
 /**
  * @brief FlashAttention-2 forward kernel
  * @param Q Query tensor [Batch, Num_heads, Seq_len, Head_dim]
