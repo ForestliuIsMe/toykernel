@@ -54,11 +54,23 @@ __global__ void flash_attention_kernel(
     __shared__ half RowAjduster[WARP_NUM][Br];
     __shared__ half RowLi[WARP_NUM][Br];
 
+    const int rows_for_each_thread = Br / 32;
+
     for(int j = warp_id * Br; j < CHUNK_SIZE; j += WARP_NUM * Br){
         // TODO: copy Qj first
+        // TODO: initialize Oj to 0
         // Qj copy complete
         __syncthreads();
-        
+
+        // Online softmax state (persistent across K/V blocks)
+        half m_prev[rows_for_each_thread];
+        half l_prev[rows_for_each_thread];
+        #pragma unroll
+        for (int i = 0; i < rows_for_each_thread; i++) {
+            m_prev[i] = -INFINITY;
+            l_prev[i] = 0.0f;
+        }
+
         // inner loop
         for(int i = 0; i < kv_seq_len; i += Bc){
         
@@ -78,51 +90,73 @@ __global__ void flash_attention_kernel(
             // adjuster = expf(oldmax - max)
             // P*V \in [Br, HEAD_DIM]
             // O = O * adjuster + P*V
-            int rows_for_each_thread = Br / 32;
-            half rowmax[rows_for_each_thread] = {-INFINITY};
-            half adjuster[rows_for_each_thread];
+            half rowmax[rows_for_each_thread];
+            #pragma unroll
+            for (int ri = 0; ri < rows_for_each_thread; ri++) rowmax[ri] = -INFINITY;
+
+            // Step 1: Find row-wise max of S
             for(int row = lane_id; row < Br; row += 32){
+                int local_row = row / 32;
                 for(int col = 0; col < Bc ; col ++){
-                    rowmax[row / 32] = max(Si[warp_id][Bc * row + col], rowmax[row / 32]);
+                    rowmax[local_row] = max(Si[warp_id][Bc * row + col], rowmax[local_row]);
                 }
-                half max = max(rowmax[row/32], rowmax_old[row/32]);
-                adjuster[row/32] = expf(rowmax_old[row/32] - max);
-
-                half row_sum = 0;
-                for(int col = 0; col < Bc; col++){
-                    // P = expf(S - max)
-                    Si[warp_id][Bc * row + col] = __expf(Si[warp_id][Bc * row + col] - max);
-                    row_sum += Si[warp_id][Bc * row + row];
-                }
-                
-                for(int col = 0; col < HEAD_DIM; col++){
-                    Oj[warp_id][HEAD_DIM * row + col] *= adjuster[row/32];
-                }
-
-                RowLi[warp_id][row] = RowLi[warp_id][row] * adjuster[row/32] + row_sum;
             }
 
-            // update O = O + SV
+            // Step 2: Online softmax update
+            for(int row = lane_id; row < Br; row += 32){
+                int local_row = row / 32;
+                half m_new = max(rowmax[local_row], m_prev[local_row]);
+                half scale = __expf(m_prev[local_row] - m_new);
+
+                // Rescale O: O = O * scale
+                for(int col = 0; col < HEAD_DIM; col++){
+                    Oj[warp_id][HEAD_DIM * row + col] *= scale;
+                }
+
+                // Compute P = exp(S - m_new), accumulate row_sum
+                half row_sum = 0;
+                for(int col = 0; col < Bc; col++){
+                    half p = __expf(Si[warp_id][Bc * row + col] - m_new);
+                    Si[warp_id][Bc * row + col] = p;  // Reuse Si to store P
+                    row_sum += p;
+                }
+
+                // Update l: l_new = l_old * scale + row_sum
+                half l_new = l_prev[local_row] * scale + row_sum;
+                l_prev[local_row] = l_new;
+                m_prev[local_row] = m_new;
+
+                // Save Li for backward pass (optional)
+                RowLi[warp_id][row] = l_new;
+            }
+
+            // update O = O + SV (MMA P @ V)
+            // Si now contains P[Br, Bc], Vi contains V[Bc, HEAD_DIM]
             for(int m = 0; m < Br ; m += 16){
                 for(int k = 0; k < Bc; k+= 16){
                     for(int sub_mma = 0; sub_mma < HEAD_DIM; sub_mma += 8){
-                        // calculate mma and store data into Si
-
+                        // calculate mma: Oj += Si @ Vi
+                        // TODO: implement MMA here
                     }
                 }
             }
 
-
-
-
+            __syncthreads();
         }
+
+        // Final normalization: O = O / l
+        for(int row = lane_id; row < Br; row += 32){
+            int local_row = row / 32;
+            half l_inv = 1.0f / l_prev[local_row];
+            for(int col = 0; col < HEAD_DIM; col++){
+                Oj[warp_id][HEAD_DIM * row + col] *= l_inv;
+            }
+        }
+
+        // TODO: Write Oj back to global memory O
+        __syncthreads();
     }
-
-
-
 }
-
-
 
 /**
  * @brief FlashAttention-2 forward kernel
