@@ -18,7 +18,7 @@
 #include "../include/utils.cuh"
 
 #define BLOCK_SIZE 64
-#define HEAD_DIM 64
+// #define HEAD_DIM 64
 
 
 /*
@@ -44,19 +44,17 @@ __global__ void flash_attention_kernel(
     int tid = threadIdx.x;
     int warp_id = WARP_ID();
     int lane_id = LANE_ID();
-    int warp_num = threadDim.x / 32;
-    int seq_iteration_num = CHUNK_SIZE / (warp_num * Br)
 
     __shared__ half Ki[Bc * HEAD_DIM];
     __shared__ half Vi[Bc * HEAD_DIM];
-    __shared__ half Qj[warp_num][Br * HEAD_DIM];
-    __shared__ half Oj[warp_num][Br * HEAD_DIM];
+    __shared__ half Qj[WARP_NUM][Br * HEAD_DIM];
+    __shared__ half Oj[WARP_NUM][Br * HEAD_DIM];
     
     __shared__ half Si[WARP_NUM][Br * Bc];
     __shared__ half RowAjduster[WARP_NUM][Br];
     __shared__ half RowLi[WARP_NUM][Br];
 
-    for(int j = warp_id * Br; j < CHUNK_SIZE; j += warp_num * Br){
+    for(int j = warp_id * Br; j < CHUNK_SIZE; j += WARP_NUM * Br){
         // TODO: copy Qj first
         // Qj copy complete
         __syncthreads();
@@ -101,7 +99,7 @@ __global__ void flash_attention_kernel(
                     Oj[warp_id][HEAD_SIZE * row + col] *= adjuster[row/32];
                 }
 
-                Li[warp_id][row] = Li[warp_id][row] * adjuster[row/32] + row_sum;
+                RowLi[warp_id][row] = RowLi[warp_id][row] * adjuster[row/32] + row_sum;
             }
 
             // update O = O + PV
