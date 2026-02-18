@@ -45,45 +45,164 @@ __global__ void flash_attention_kernel(
     int warp_id = WARP_ID();
     int lane_id = LANE_ID();
 
+    // Calculate batch and head indices
+    int head_id = blockIdx.y;
+    int batch_idx = blockIdx.z;
+
     __shared__ half Ki[Bc * HEAD_DIM];
     __shared__ half Vi[Bc * HEAD_DIM];
     __shared__ half Qj[WARP_NUM][Br * HEAD_DIM];
     __shared__ half Oj[WARP_NUM][Br * HEAD_DIM];
     
     __shared__ half Si[WARP_NUM][Br * Bc];
-    __shared__ half RowAjduster[WARP_NUM][Br];
     __shared__ half RowLi[WARP_NUM][Br];
 
     const int rows_for_each_thread = Br / 32;
 
     for(int j = warp_id * Br; j < CHUNK_SIZE; j += WARP_NUM * Br){
-        // TODO: copy Qj first
-        // TODO: initialize Oj to 0
-        // Qj copy complete
+        // Load Qj from global memory: Q[batch, head_id, j:j+Br, :]
+        // Each warp loads its own Br * HEAD_DIM block
+        int q_base = (batch_idx * num_heads + head_id) * CHUNK_SIZE * HEAD_DIM + j * HEAD_DIM;
+        for(int row = tid; row < Br * HEAD_DIM; row += WARP_NUM * 32) {
+            int r = row / HEAD_DIM;
+            int c = row % HEAD_DIM;
+            int global_row = j + r;
+            if(global_row < CHUNK_SIZE) {
+                // Load Q and apply sqrt(softmax_scale) to avoid post-MMA scaling
+                float q_val = __half2float(Q[q_base + r * HEAD_DIM + c]);
+                Qj[warp_id][row] = __float2half(q_val * sqrtf(softmax_scale));
+            } else {
+                Qj[warp_id][row] = __float2half(0.0f);
+            }
+        }
+        // Initialize Oj to 0
+        for(int row = tid; row < Br * HEAD_DIM; row += WARP_NUM * 32) {
+            Oj[warp_id][row] = __float2half(0.0f);
+        }
         __syncthreads();
 
         // Online softmax state (persistent across K/V blocks)
         half m_prev[rows_for_each_thread];
         half l_prev[rows_for_each_thread];
         #pragma unroll
-        for (int i = 0; i < rows_for_each_thread; i++) {
-            m_prev[i] = -INFINITY;
-            l_prev[i] = 0.0f;
+        for (int ri = 0; ri < rows_for_each_thread; ri++) {
+            m_prev[ri] = -INFINITY;
+            l_prev[ri] = 0.0f;
         }
 
         // inner loop
         for(int i = 0; i < kv_seq_len; i += Bc){
         
-            // calculate S = QK
+            // Load Ki, Vi from global to shared memory (synchronous)
+            int kv_base = (batch_idx * num_heads + head_id) * kv_seq_len * HEAD_DIM + i * HEAD_DIM;
+
+            // Load Ki: K[i:i+Bc, :]
+            for(int row = tid; row < Bc * HEAD_DIM; row += WARP_NUM * 32) {
+                int r = row / HEAD_DIM;
+                int c = row % HEAD_DIM;
+                int global_row = i + r;
+                if(global_row < kv_seq_len) {
+                    Ki[row] = K[kv_base + r * HEAD_DIM + c];
+                } else {
+                    Ki[row] = __float2half(0.0f);
+                }
+            }
+
+            // Load Vi: V[i:i+Bc, :]
+            for(int row = tid; row < Bc * HEAD_DIM; row += WARP_NUM * 32) {
+                int r = row / HEAD_DIM;
+                int c = row % HEAD_DIM;
+                int global_row = i + r;
+                if(global_row < kv_seq_len) {
+                    Vi[row] = V[kv_base + r * HEAD_DIM + c];
+                } else {
+                    Vi[row] = __float2half(0.0f);
+                }
+            }
+            __syncthreads();
+
+            // calculate S = QK using PTX MMA
+            // Qj: [Br, HEAD_DIM], Ki: [Bc, HEAD_DIM] (transposed conceptually)
+            // S: [warp_num][Br, Bc]
             for(int m = 0; m < Br ; m += 16){
                 for(int k = 0; k < HEAD_DIM; k+= 16){
-                    // copy Ki
-                    // for each sub k
+                    // Each warp computes 16xBc slice of S
                     for(int sub_mma = 0; sub_mma < Bc; sub_mma += 8){
-                        // calculate mma and store data into Si
+                        // MMA m16n8k16: A[16,16] @ B[16,8] -> C[16,8]
+                        // Load A from Qj: 16 rows from m, 16 cols from k
+                        // Load B from Ki: 8 rows from sub_mma, 16 cols from k (K^T)
+
+                        uint32_t a_reg[4];  // 16x16 f16 = 256 elements / 32 threads = 8 f16 = 4 uint32_t
+                        uint32_t b_reg[2];  // 16x8 f16 = 128 elements / 32 threads = 4 f16 = 2 uint32_t
+                        uint32_t c_reg[2];  // 16x8 f16 accumulator
+
+                        // Initialize accumulator to 0
+                        #pragma unroll
+                        for(int i = 0; i < 2; i++) c_reg[i] = 0;
+
+                        // Load A from shared memory (Qj)
+                        // MMA A matrix: 16x16 row-major
+                        // Each thread owns: row = lane_id % 16, col group = lane_id / 16
+                        #pragma unroll
+                        for(int i = 0; i < 4; i++){
+                            int row = (lane_id % 16);  // 0-15
+                            int col_group = (lane_id / 16);  // 0 or 1 (for 16x16)
+                            int col = col_group * 8 + i * 2;  // 0,2,4,6 or 8,10,12,14
+                            int q_offset = (m + row) * HEAD_DIM + (k + col);
+                            asm volatile("ld.shared.b32 %0, [%1];" :
+                                "=r"(a_reg[i]) :
+                                "r"((uint32_t)__cvta_generic_to_shared(&Qj[warp_id][q_offset]))
+                            );
+                        }
+
+                        // Load B from shared memory (Ki^T)
+                        // MMA B matrix: 16x8 column-major (conceptually K^T)
+                        // K is [Bc, HEAD_DIM] row-major, we need K^T[k:k+16, sub_mma:sub_mma+8]
+                        // For col-major B in MMA: B[row, col] where row=0-15, col=0-7
+                        // Thread mapping: 4 threads per column
+                        #pragma unroll
+                        for(int i = 0; i < 2; i++){
+                            int col = (lane_id % 8);  // 0-7 (column in B/K^T)
+                            int row_group = (lane_id / 8);  // 0-3
+                            int row = row_group * 4 + i * 2;  // 0,2,4,6 or 0,2,4,6
+                            // K[col][k+row] in row-major K = K^T[row][col]
+                            int k_offset = (sub_mma + col) * HEAD_DIM + (k + row);
+                            asm volatile("ld.shared.b32 %0, [%1];" :
+                                "=r"(b_reg[i]) :
+                                "r"((uint32_t)__cvta_generic_to_shared(&Ki[k_offset]))
+                            );
+                        }
+
+                        // MMA instruction: m16n8k16
+                        asm volatile(
+                            "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+                            "{%0, %1}, "    // D (accumulator)
+                            "{%2, %3, %4, %5}, "  // A
+                            "{%6, %7}, "    // B
+                            "{%8, %9};"     // C
+                            :
+                            "=r"(c_reg[0]), "=r"(c_reg[1])
+                            :
+                            "r"(a_reg[0]), "r"(a_reg[1]), "r"(a_reg[2]), "r"(a_reg[3]),
+                            "r"(b_reg[0]), "r"(b_reg[1]),
+                            "r"(c_reg[0]), "r"(c_reg[1])
+                        );
+
+                        // Store result to Si (no scale needed, applied during Q load)
+                        #pragma unroll
+                        for(int i = 0; i < 2; i++){
+                            int row = (lane_id / 4);  // 0-7
+                            int col = (lane_id % 4) * 2 + i * 8;  // 0,2 or 8,10
+                            // c_reg contains packed half values from MMA
+                            int s_offset = (m + row) * Bc + (sub_mma + col);
+                            if(s_offset < Br * Bc){
+                                *(uint32_t*)(&Si[warp_id][s_offset]) = c_reg[i];
+                            }
+                        }
                     }
                 }
             }
+            __syncthreads();
 
             // calculate max
             // max = max(rowmax(S),oldmax)   \in [Br]
@@ -130,13 +249,78 @@ __global__ void flash_attention_kernel(
                 RowLi[warp_id][row] = l_new;
             }
 
-            // update O = O + SV (MMA P @ V)
-            // Si now contains P[Br, Bc], Vi contains V[Bc, HEAD_DIM]
+            // update O = O + PV (MMA P @ V) using PTX
+            // Si: [warp_num][Br, Bc] contains P, Vi: [Bc, HEAD_DIM]
             for(int m = 0; m < Br ; m += 16){
                 for(int k = 0; k < Bc; k+= 16){
                     for(int sub_mma = 0; sub_mma < HEAD_DIM; sub_mma += 8){
-                        // calculate mma: Oj += Si @ Vi
-                        // TODO: implement MMA here
+                        // MMA m16n8k16: P[16,16] @ V[16,8] -> O[16,8]
+                        uint32_t a_reg[4];  // P tile: 16x16
+                        uint32_t b_reg[2];  // V tile: 16x8
+                        uint32_t c_reg[2];  // O accumulator
+
+                        // Load accumulator from Oj (load-add-store pattern)
+                        #pragma unroll
+                        for(int i = 0; i < 2; i++){
+                            int row = (lane_id / 4);
+                            int col = (lane_id % 4) * 2 + i * 8;
+                            int o_offset = (m + row) * HEAD_DIM + (sub_mma + col);
+                            half2 o_val = *(half2*)(&Oj[warp_id][o_offset]);
+                            c_reg[i] = __pack_half2(o_val.x, o_val.y);
+                        }
+
+                        // Load A from Si (P matrix) [Br, Bc]
+                        #pragma unroll
+                        for(int i = 0; i < 4; i++){
+                            int row = (lane_id % 16);
+                            int col_group = (lane_id / 16);
+                            int col = col_group * 8 + i * 2;
+                            int p_offset = (m + row) * Bc + (k + col);
+                            asm volatile("ld.shared.b32 %0, [%1];" :
+                                "=r"(a_reg[i]) :
+                                "r"((uint32_t)__cvta_generic_to_shared(&Si[warp_id][p_offset]))
+                            );
+                        }
+
+                        // Load B from Vi (V matrix) [Bc, HEAD_DIM]
+                        // V^T for MMA: V^T[k:k+16, sub_mma:sub_mma+8]
+                        #pragma unroll
+                        for(int i = 0; i < 2; i++){
+                            int col = (lane_id % 8);  // 0-7
+                            int row_group = (lane_id / 8);
+                            int row = row_group * 4 + i * 2;
+                            // V[col][sub_mma+row] = V^T[row][col]
+                            int v_offset = (k + col) * HEAD_DIM + (sub_mma + row);
+                            asm volatile("ld.shared.b32 %0, [%1];" :
+                                "=r"(b_reg[i]) :
+                                "r"((uint32_t)__cvta_generic_to_shared(&Vi[v_offset]))
+                            );
+                        }
+
+                        // MMA: O += P @ V
+                        asm volatile(
+                            "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+                            "{%0, %1}, "
+                            "{%2, %3, %4, %5}, "
+                            "{%6, %7}, "
+                            "{%8, %9};"
+                            :
+                            "=r"(c_reg[0]), "=r"(c_reg[1])
+                            :
+                            "r"(a_reg[0]), "r"(a_reg[1]), "r"(a_reg[2]), "r"(a_reg[3]),
+                            "r"(b_reg[0]), "r"(b_reg[1]),
+                            "r"(c_reg[0]), "r"(c_reg[1])
+                        );
+
+                        // Store result back to Oj
+                        #pragma unroll
+                        for(int i = 0; i < 2; i++){
+                            int row = (lane_id / 4);
+                            int col = (lane_id % 4) * 2 + i * 8;
+                            int o_offset = (m + row) * HEAD_DIM + (sub_mma + col);
+                            // Direct store of packed uint32_t to shared memory
+                            *(uint32_t*)(&Oj[warp_id][o_offset]) = c_reg[i];
+                        }
                     }
                 }
             }
@@ -153,7 +337,16 @@ __global__ void flash_attention_kernel(
             }
         }
 
-        // TODO: Write Oj back to global memory O
+        // Write Oj back to global memory O
+        int o_base = (batch_idx * num_heads + head_id) * CHUNK_SIZE * HEAD_DIM + j * HEAD_DIM;
+        for(int row = tid; row < Br * HEAD_DIM; row += WARP_NUM * 32) {
+            int r = row / HEAD_DIM;
+            int c = row % HEAD_DIM;
+            int global_row = j + r;
+            if(global_row < CHUNK_SIZE) {
+                O[o_base + r * HEAD_DIM + c] = Oj[warp_id][row];
+            }
+        }
         __syncthreads();
     }
 }
