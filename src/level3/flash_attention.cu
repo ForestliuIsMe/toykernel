@@ -21,16 +21,71 @@
 // #define HEAD_DIM 64
 
 
-/*
-    Q: [batch, heads, head_dim, m]
-    K: [batch, heads, head_dim, n]
-    V: [batch, heads, head_dim, n]
-
-    Br is the block size of Qi      integer multiply of 16
-    Bc is the block size of Ki,Vi.  integer multiply of 16
-    CHUNK_SIZE is total seq len of Qi
-    CHUNK_SIZE / (WARP_NUM * Br)   ==> seq dimention iteration number
-*/
+/**
+ * @brief FlashAttention-2 forward kernel with PTX MMA optimization
+ *
+ * Implements efficient attention computation O = softmax(Q @ K^T / sqrt(d)) @ V
+ * using the FlashAttention-2 algorithm with warp-level parallelism and TensorCore MMA.
+ *
+ * Algorithm Overview:
+ * 1. Tile Q, K, V into SRAM blocks (Qj, Ki, Vi) to reduce HBM bandwidth
+ * 2. Compute attention scores S = Qj @ Ki^T using PTX mma.sync.aligned.m16n8k16
+ * 3. Apply online softmax with rescaling (FlashAttention-2 style)
+ * 4. Compute output O = P @ V using MMA accumulation
+ * 5. Normalize and write back to global memory
+ *
+ * Memory Layout:
+ * - Q: [batch, num_heads, q_seq_len, head_dim] (row-major)
+ * - K: [batch, num_heads, kv_seq_len, head_dim] (row-major)
+ * - V: [batch, num_heads, kv_seq_len, head_dim] (row-major)
+ * - O: [batch, num_heads, q_seq_len, head_dim] (row-major)
+ *
+ * Grid Configuration:
+ * - gridDim.x: 1 (CHUNK_SIZE handled by warps)
+ * - gridDim.y: num_heads
+ * - gridDim.z: batch_size
+ * - blockDim.x: WARP_NUM * 32 (threads per block)
+ *
+ * Shared Memory Usage per Block:
+ * - Ki:  Bc * HEAD_DIM * sizeof(half)  // Key tile
+ * - Vi:  Bc * HEAD_DIM * sizeof(half)  // Value tile
+ * - Qj:  WARP_NUM * Br * HEAD_DIM * sizeof(half)  // Query tiles (per warp)
+ * - Oj:  WARP_NUM * Br * HEAD_DIM * sizeof(half)  // Output accumulators (per warp)
+ * - Si:  WARP_NUM * Br * Bc * sizeof(half)        // Attention scores (per warp)
+ * - RowLi: WARP_NUM * Br * sizeof(half)           // Softmax sum L (for backward)
+ *
+ * @tparam WARP_NUM     Number of warps per block (typically 4 or 8)
+ * @tparam HEAD_DIM     Head dimension (must be multiple of 16, typically 64 or 128)
+ * @tparam Bc           KV sequence block size (must be multiple of 8, typically 64 or 128)
+ * @tparam Br           Query sequence block size (must be multiple of 16, typically 64 or 128)
+ * @tparam CHUNK_SIZE   Query sequence length processed per kernel launch
+ *
+ * @param[in]  Q              Query tensor [batch, heads, CHUNK_SIZE, HEAD_DIM]
+ * @param[in]  K              Key tensor [batch, heads, kv_seq_len, HEAD_DIM]
+ * @param[in]  V              Value tensor [batch, heads, kv_seq_len, HEAD_DIM]
+ * @param[out] O              Output tensor [batch, heads, CHUNK_SIZE, HEAD_DIM]
+ * @param[in]  softmax_scale  Pre-computed scale factor (1/sqrt(head_dim))
+ * @param[in]  kv_seq_len     Length of key/value sequence (may differ from CHUNK_SIZE)
+ * @param[in]  num_heads      Number of attention heads
+ *
+ * @note Requires Ampere architecture (sm_80+) for MMA and __pack_half2 support
+ * @note Q/K/V/O must be aligned to 16 bytes for optimal global memory access
+ * @note This kernel does not implement causal masking (future work)
+ *
+ * Example Launch:
+ * @code
+ * const int WARP_NUM = 4;
+ * const int HEAD_DIM = 64;
+ * const int Bc = 64;
+ * const int Br = 64;
+ * const int CHUNK_SIZE = 1024;
+ *
+ * dim3 block(WARP_NUM * 32);  // 128 threads
+ * dim3 grid(1, num_heads, batch_size);
+ * flash_attention_kernel<WARP_NUM, HEAD_DIM, Bc, Br, CHUNK_SIZE>
+ *     <<<grid, block>>>(Q, K, V, O, 1.0f/sqrtf(HEAD_DIM), kv_seq_len, num_heads);
+ * @endcode
+ */
 template<int WARP_NUM, int HEAD_DIM, int Bc, int Br, int CHUNK_SIZE>
 __global__ void flash_attention_kernel(
     const half* __restrict Q,
@@ -351,141 +406,106 @@ __global__ void flash_attention_kernel(
     }
 }
 
+
 /**
- * @brief FlashAttention-2 forward kernel
- * @param Q Query tensor [Batch, Num_heads, Seq_len, Head_dim]
- * @param K Key tensor
- * @param V Value tensor
- * @param O Output tensor
- * @param softmax_scale = 1/sqrt(d)
- * @param seqlen Sequence length
- * @param num_heads Number of attention heads
+ * @brief Convenience wrapper for flash_attention_kernel with automatic template instantiation
+ *
+ * Launches the optimized FlashAttention-2 kernel with pre-configured tile sizes based on head dimension.
+ * Automatically selects optimal Br/Bc block sizes for common configurations.
+ *
+ * @tparam HEAD_DIM     Head dimension (64 or 128 supported)
+ * @tparam WARP_NUM     Number of warps (default: 4)
+ *
+ * @param[in]  Q              Query tensor [batch, heads, seq_len, head_dim] (fp16)
+ * @param[in]  K              Key tensor [batch, heads, kv_seq_len, head_dim] (fp16)
+ * @param[in]  V              Value tensor [batch, heads, kv_seq_len, head_dim] (fp16)
+ * @param[out] O              Output tensor [batch, heads, seq_len, head_dim] (fp16)
+ * @param[in]  softmax_scale  Pre-computed scale factor (typically 1/sqrt(head_dim))
+ * @param[in]  batch_size     Batch size
+ * @param[in]  num_heads      Number of attention heads
+ * @param[in]  seq_len        Query/Output sequence length (CHUNK_SIZE)
+ * @param[in]  kv_seq_len     Key/Value sequence length (may differ for cross-attention)
+ *
+ * @throws cudaError_t if kernel launch fails (checked via CUDA_KERNEL_CHECK)
+ *
+ * @note Q/K/V/O must be device pointers to fp16 (__half) data
+ * @note seq_len must be <= CHUNK_SIZE template parameter
+ * @note For seq_len > 256, consider using multiple kernel launches or increasing WARP_NUM
+ *
+ * Example:
+ * @code
+ * half *d_Q, *d_K, *d_V, *d_O;  // device pointers, allocated via cudaMalloc
+ * float scale = 1.0f / sqrtf(64.0f);
+ *
+ * flash_attention_fwd_wrapper<64, 4>(
+ *     d_Q, d_K, d_V, d_O, scale,
+ *     batch_size=32, num_heads=8,
+ *     seq_len=1024, kv_seq_len=1024
+ * );
+ * @endcode
  */
-__global__ void flash_attention_fwd_kernel(
-    const float* Q, const float* K, const float* V, float* O,
-    float softmax_scale, int seqlen, int num_heads
+template<int HEAD_DIM = 64, int WARP_NUM = 4>
+inline void flash_attention_fwd_wrapper(
+    const half* __restrict Q,
+    const half* __restrict K,
+    const half* __restrict V,
+    half* O,
+    float softmax_scale,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    int kv_seq_len
 ) {
-    int bid = blockIdx.x;  // Block index along sequence
-    int tid = threadIdx.x; // Thread index within block
-    int head_id = blockIdx.y;
+    // Select tile sizes based on head dimension
+    constexpr int Bc = (HEAD_DIM <= 64) ? 64 : 32;   // KV block size
+    constexpr int Br = (HEAD_DIM <= 64) ? 64 : 32;   // Query block size
 
-    // Shared memory for QK block and V block
-    extern __shared__ float smem[];
-    float* Qi = smem;                    // [BLOCK_SIZE, HEAD_DIM]
-    float* Kj = smem + BLOCK_SIZE * HEAD_DIM;    // [BLOCK_SIZE, HEAD_DIM]
-    float* Vi = smem + 2 * BLOCK_SIZE * HEAD_DIM; // [BLOCK_SIZE, HEAD_DIM]
+    // Grid: (1, heads, batch) - each block handles CHUNK_SIZE via warps
+    dim3 block(WARP_NUM * 32);
+    dim3 grid(1, num_heads, batch_size);
 
-    int qo_len = seqlen;
+    // Ensure seq_len fits within CHUNK_SIZE
+    // For larger sequences, caller should partition into multiple launches
+    const int CHUNK_SIZE = ((seq_len + Br - 1) / Br) * Br;  // Round up to Br multiple
 
-    // Thread-local softmax statistics
-    float row_m = -INFINITY;  // max
-    float row_l = 0.0f;      // sum of exp
-    float row_o[HEAD_DIM];   // output accumulator
-
-    for (int i = 0; i < HEAD_DIM; ++i) {
-        row_o[i] = 0.0f;
-    }
-
-    // Load Q tile
-    int q_row = bid * BLOCK_SIZE + tid;
-    if (q_row < qo_len) {
-        int q_offset = head_id * qo_len * HEAD_DIM + q_row * HEAD_DIM;
-        for (int d = 0; d < HEAD_DIM; d += BLOCK_SIZE) {
-            int local_d = tid + d;
-            if (local_d < HEAD_DIM) {
-                Qi[tid * HEAD_DIM + local_d] = Q[q_offset + local_d];
-            }
+    // Launch kernel with dynamic CHUNK_SIZE through template (must be compile-time constant)
+    // For production use, consider multiple instantiations or dynamic scheduling
+    if constexpr (HEAD_DIM == 64) {
+        if (seq_len <= 64) {
+            flash_attention_kernel<WARP_NUM, 64, 64, 64, 64>
+                <<<grid, block>>>(Q, K, V, O, softmax_scale, kv_seq_len, num_heads);
+        } else if (seq_len <= 128) {
+            flash_attention_kernel<WARP_NUM, 64, 64, 64, 128>
+                <<<grid, block>>>(Q, K, V, O, softmax_scale, kv_seq_len, num_heads);
+        } else if (seq_len <= 256) {
+            flash_attention_kernel<WARP_NUM, 64, 64, 64, 256>
+                <<<grid, block>>>(Q, K, V, O, softmax_scale, kv_seq_len, num_heads);
+        } else if (seq_len <= 512) {
+            flash_attention_kernel<WARP_NUM, 64, 64, 64, 512>
+                <<<grid, block>>>(Q, K, V, O, softmax_scale, kv_seq_len, num_heads);
+        } else {
+            flash_attention_kernel<WARP_NUM, 64, 64, 64, 1024>
+                <<<grid, block>>>(Q, K, V, O, softmax_scale, kv_seq_len, num_heads);
+        }
+    } else if constexpr (HEAD_DIM == 128) {
+        if (seq_len <= 64) {
+            flash_attention_kernel<WARP_NUM, 128, 32, 32, 64>
+                <<<grid, block>>>(Q, K, V, O, softmax_scale, kv_seq_len, num_heads);
+        } else if (seq_len <= 128) {
+            flash_attention_kernel<WARP_NUM, 128, 32, 32, 128>
+                <<<grid, block>>>(Q, K, V, O, softmax_scale, kv_seq_len, num_heads);
+        } else {
+            flash_attention_kernel<WARP_NUM, 128, 32, 32, 256>
+                <<<grid, block>>>(Q, K, V, O, softmax_scale, kv_seq_len, num_heads);
         }
     } else {
-        for (int d = 0; d < HEAD_DIM; ++d) {
-            Qi[tid * HEAD_DIM + d] = 0.0f;
-        }
-    }
-    __syncthreads();
-
-    // Loop over K/V blocks
-    for (int block_j = 0; block_j < seqlen; block_j += BLOCK_SIZE) {
-        // Load K tile
-        int k_row = block_j + tid;
-        if (k_row < seqlen) {
-            int k_offset = head_id * seqlen * HEAD_DIM + k_row * HEAD_DIM;
-            for (int d = 0; d < HEAD_DIM; d += BLOCK_SIZE) {
-                int local_d = tid + d;
-                if (local_d < HEAD_DIM) {
-                    Kj[tid * HEAD_DIM + local_d] = K[k_offset + local_d];
-                    Vi[tid * HEAD_DIM + local_d] = V[k_offset + local_d];
-                }
-            }
-        } else {
-            for (int d = 0; d < HEAD_DIM; ++d) {
-                Kj[tid * HEAD_DIM + d] = 0.0f;
-                Vi[tid * HEAD_DIM + d] = 0.0f;
-            }
-        }
-        __syncthreads();
-
-        // Compute Q @ K^T for this block
-        // Each thread computes dot product of Q[i] with K[j]
-        float qk[BLOCK_SIZE];  // Per-thread temporary storage
-
-        for (int j = 0; j < BLOCK_SIZE && (block_j + j) < seqlen; ++j) {
-            float sum = 0.0f;
-            for (int d = 0; d < HEAD_DIM; ++d) {
-                sum += Qi[tid * HEAD_DIM + d] * Kj[j * HEAD_DIM + d];
-            }
-            qk[j] = sum * softmax_scale;
-        }
-
-        // Online softmax
-        float row_m_new = row_m;
-        for (int j = 0; j < BLOCK_SIZE && (block_j + j) < seqlen; ++j) {
-            row_m_new = fmaxf(row_m_new, qk[j]);
-        }
-
-        float row_scale = expf(row_m - row_m_new);
-        float row_l_new = 0.0f;
-        for (int j = 0; j < BLOCK_SIZE && (block_j + j) < seqlen; ++j) {
-            qk[j] = expf(qk[j] - row_m_new);
-            row_l_new += qk[j];
-        }
-
-        // Rescale output
-        for (int d = 0; d < HEAD_DIM; ++d) {
-            row_o[d] = row_o[d] * row_scale;
-        }
-
-        // Accumulate O = O * scale + softmax(QK) @ V
-        for (int j = 0; j < BLOCK_SIZE && (block_j + j) < seqlen; ++j) {
-            for (int d = 0; d < HEAD_DIM; ++d) {
-                row_o[d] += qk[j] * Vi[j * HEAD_DIM + d];
-            }
-        }
-
-        row_m = row_m_new;
-        row_l = row_l * row_scale + row_l_new;
-
-        __syncthreads();
+        static_assert(HEAD_DIM == 64 || HEAD_DIM == 128, "Unsupported HEAD_DIM");
     }
 
-    // Normalize
-    float row_l_inv = 1.0f / row_l;
-    for (int d = 0; d < HEAD_DIM; ++d) {
-        row_o[d] *= row_l_inv;
-    }
-
-    // Write output
-    if (q_row < qo_len) {
-        int o_offset = head_id * qo_len * HEAD_DIM + q_row * HEAD_DIM;
-        for (int d = 0; d < HEAD_DIM; d += BLOCK_SIZE) {
-            int local_d = tid + d;
-            if (local_d < HEAD_DIM) {
-                O[o_offset + local_d] = row_o[local_d];
-            }
-        }
-    }
+    CUDA_KERNEL_CHECK();
 }
 
-// Wrapper
+// Wrapper for the reference float kernel (legacy)
 void flash_attention_fwd(const float* Q, const float* K, const float* V,
                           float* O, float softmax_scale, int seqlen, int num_heads) {
     dim3 block(BLOCK_SIZE);
