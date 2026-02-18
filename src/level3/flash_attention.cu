@@ -76,7 +76,7 @@ __global__ void flash_attention_kernel(
             // calculate max
             // max = max(rowmax(S),oldmax)   \in [Br]
             // adjuster = expf(oldmax - max)
-            // P*V \in [Br, HEAD_SIZE]
+            // P*V \in [Br, HEAD_DIM]
             // O = O * adjuster + P*V
             int rows_for_each_thread = Br / 32;
             half rowmax[rows_for_each_thread] = {-INFINITY};
@@ -89,23 +89,23 @@ __global__ void flash_attention_kernel(
                 adjuster[row/32] = expf(rowmax_old[row/32] - max);
 
                 half row_sum = 0;
-                for(int col = 0; col < Br; col++){
+                for(int col = 0; col < Bc; col++){
                     // P = expf(S - max)
-                    Pi[warp_id][Bc * row + col] = __expf(Si[warp_id][Bc * row + col] - max);
-                    row_sum += Pi[warp_id][Bc * row + row];
+                    Si[warp_id][Bc * row + col] = __expf(Si[warp_id][Bc * row + col] - max);
+                    row_sum += Si[warp_id][Bc * row + row];
                 }
                 
-                for(int col = 0; col < HEAD_SIZE; col++){
-                    Oj[warp_id][HEAD_SIZE * row + col] *= adjuster[row/32];
+                for(int col = 0; col < HEAD_DIM; col++){
+                    Oj[warp_id][HEAD_DIM * row + col] *= adjuster[row/32];
                 }
 
                 RowLi[warp_id][row] = RowLi[warp_id][row] * adjuster[row/32] + row_sum;
             }
 
-            // update O = O + PV
+            // update O = O + SV
             for(int m = 0; m < Br ; m += 16){
                 for(int k = 0; k < Bc; k+= 16){
-                    for(int sub_mma = 0; sub_mma < HEAD_SIZE; sub_mma += 8){
+                    for(int sub_mma = 0; sub_mma < HEAD_DIM; sub_mma += 8){
                         // calculate mma and store data into Si
 
                     }
